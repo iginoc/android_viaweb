@@ -331,7 +331,7 @@ class MainActivity : ComponentActivity() {
         }
 
         createDefaultIndexHtml(defaultDir)
-        startServer(currentServedPath)
+        startServer()
 
         setContent {
             Android_viawebTheme {
@@ -351,7 +351,6 @@ class MainActivity : ComponentActivity() {
                             BATTERY_TAG -> startBatteryServing()
                             else -> {
                                 currentServedPath = newPath
-                                restartServer(newPath)
                             }
                         }
                     },
@@ -909,8 +908,7 @@ class MainActivity : ComponentActivity() {
         try { indexFile.writeText(html) } catch (e: Exception) { e.printStackTrace() }
     }
 
-    private fun startServer(path: String) {
-        val dir = File(path)
+    private fun startServer() {
         server = embeddedServer(Netty, port = 8080) {
             routing {
                 post("/api/flashlight") {
@@ -1039,7 +1037,6 @@ class MainActivity : ComponentActivity() {
                             BATTERY_TAG -> startBatteryServing()
                             else -> {
                                 currentServedPath = path
-                                restartServer(path)
                             }
                         }
                     }
@@ -1069,12 +1066,14 @@ class MainActivity : ComponentActivity() {
                 }
 
                 get("/") {
-                    when (currentServedPath) {
+                    val currentPath = currentServedPath
+                    when (currentPath) {
                         SCREEN_MIRROR_TAG -> call.respondText(getProjectionHtml(), ContentType.Text.Html)
                         NOTIFICATIONS_TAG -> call.respondText(getNotificationsHtml(), ContentType.Text.Html)
                         GPS_TAG -> call.respondText(getGpsHtml(), ContentType.Text.Html)
                         BATTERY_TAG -> call.respondText(getBatteryHtml(), ContentType.Text.Html)
                         else -> {
+                            val dir = File(currentPath)
                             val indexHtml = File(dir, "index.html")
                             if (indexHtml.exists()) call.respondFile(indexHtml)
                             else {
@@ -1087,15 +1086,16 @@ class MainActivity : ComponentActivity() {
                 
                 get("/{path...}") {
                     val relativePath = call.parameters.getAll("path")?.joinToString("/") ?: ""
+                    val currentPath = currentServedPath
                     if (relativePath == "index.html" || relativePath == "index.htm") {
-                        when (currentServedPath) {
+                        when (currentPath) {
                             SCREEN_MIRROR_TAG -> { call.respondText(getProjectionHtml(), ContentType.Text.Html); return@get }
                             NOTIFICATIONS_TAG -> { call.respondText(getNotificationsHtml(), ContentType.Text.Html); return@get }
                             GPS_TAG -> { call.respondText(getGpsHtml(), ContentType.Text.Html); return@get }
                             BATTERY_TAG -> { call.respondText(getBatteryHtml(), ContentType.Text.Html); return@get }
                         }
                     }
-                    val requestedFile = File(dir, relativePath)
+                    val requestedFile = File(File(currentPath), relativePath)
                     if (!requestedFile.exists()) { call.respond(HttpStatusCode.NotFound, "File not found"); return@get }
                     if (requestedFile.isDirectory) {
                         val indexHtml = File(requestedFile, "index.html")
@@ -1131,11 +1131,6 @@ class MainActivity : ComponentActivity() {
             append(getWatchdogScript(currentServedPath))
             append("</body></html>")
         }
-    }
-
-    private fun restartServer(newPath: String) {
-        server?.stop(1000, 2000)
-        startServer(newPath)
     }
 
     override fun onDestroy() {
