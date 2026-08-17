@@ -13,12 +13,18 @@ import android.hardware.camera2.*
 import android.content.Context
 import android.content.pm.PackageManager
 import android.content.ComponentName
+import android.view.Surface
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.media.ImageReader
 import android.media.projection.MediaProjectionManager
 import android.os.Handler
 import android.os.HandlerThread
 import android.provider.Settings
 import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
 import android.net.Uri
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -48,6 +54,8 @@ import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.LocationOn
+import androidx.compose.material.icons.filled.BatteryFull
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -99,6 +107,8 @@ import kotlin.system.exitProcess
 
 private const val SCREEN_MIRROR_TAG = "INTERNAL://SCREEN_MIRROR"
 private const val NOTIFICATIONS_TAG = "INTERNAL://NOTIFICATIONS"
+private const val GPS_TAG = "INTERNAL://GPS"
+private const val BATTERY_TAG = "INTERNAL://BATTERY"
 
 class MainActivity : ComponentActivity() {
     private var server: EmbeddedServer<*, *>? = null
@@ -116,8 +126,28 @@ class MainActivity : ComponentActivity() {
 
     private var photoDeferred: CompletableDeferred<File>? = null
     private var lastPhotoFile: File? = null
+    private var lastLocation: Location? = null
     private val favoritePaths = mutableStateListOf<String>()
     private lateinit var favoritesManager: FavoritesManager
+
+    private fun startLocationUpdates() {
+        val locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        try {
+            locationManager.requestLocationUpdates(
+                LocationManager.GPS_PROVIDER,
+                2000L,
+                1f,
+                object : LocationListener {
+                    override fun onLocationChanged(location: Location) {
+                        lastLocation = location
+                    }
+                    override fun onProviderEnabled(provider: String) {}
+                    override fun onProviderDisabled(provider: String) {}
+                    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+                }
+            )
+        } catch (e: SecurityException) { e.printStackTrace() }
+    }
 
     private fun isNotificationServiceEnabled(): Boolean {
         val pkgName = packageName
@@ -130,6 +160,77 @@ class MainActivity : ComponentActivity() {
             }
         }
         return false
+    }
+
+    private fun getBatteryInfo(): Map<String, Any> {
+        val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val health = intent?.getIntExtra(BatteryManager.EXTRA_HEALTH, -1) ?: -1
+        val voltage = intent?.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1) ?: -1
+        val temperature = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, -1) ?: -1
+        val technology = intent?.getStringExtra(BatteryManager.EXTRA_TECHNOLOGY) ?: "Unknown"
+        val plugged = intent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1
+
+        val batteryPct = if (level != -1 && scale != -1) level / scale.toFloat() * 100 else -1f
+
+        val statusStr = when (status) {
+            BatteryManager.BATTERY_STATUS_CHARGING -> "Charging"
+            BatteryManager.BATTERY_STATUS_DISCHARGING -> "Discharging"
+            BatteryManager.BATTERY_STATUS_FULL -> "Full"
+            BatteryManager.BATTERY_STATUS_NOT_CHARGING -> "Not Charging"
+            else -> "Unknown"
+        }
+
+        val healthStr = when (health) {
+            BatteryManager.BATTERY_HEALTH_COLD -> "Cold"
+            BatteryManager.BATTERY_HEALTH_DEAD -> "Dead"
+            BatteryManager.BATTERY_HEALTH_GOOD -> "Good"
+            BatteryManager.BATTERY_HEALTH_OVERHEAT -> "Overheat"
+            BatteryManager.BATTERY_HEALTH_OVER_VOLTAGE -> "Over Voltage"
+            BatteryManager.BATTERY_HEALTH_UNSPECIFIED_FAILURE -> "Unspecified Failure"
+            else -> "Unknown"
+        }
+
+        val pluggedStr = when (plugged) {
+            BatteryManager.BATTERY_PLUGGED_AC -> "AC"
+            BatteryManager.BATTERY_PLUGGED_USB -> "USB"
+            BatteryManager.BATTERY_PLUGGED_WIRELESS -> "Wireless"
+            else -> "Battery"
+        }
+
+        val batteryManager = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+        
+        // Try to get CURRENT_NOW, fallback to CURRENT_AVERAGE if 0
+        var currentNow = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
+        if (currentNow == 0 || currentNow == Int.MIN_VALUE) {
+            currentNow = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE)
+        }
+        
+        // On some devices current is in mA, on others in uA. 
+        // If it's very large, it's likely uA.
+        val currentMA = if (kotlin.math.abs(currentNow) > 10000) currentNow / 1000 else currentNow
+        
+        val currentAmp = currentMA / 1000.0
+        val powerWatt = (voltage / 1000.0) * currentAmp
+
+        // Detection of some common battery charging limits/protections
+        val isPlugged = plugged == BatteryManager.BATTERY_PLUGGED_AC || plugged == BatteryManager.BATTERY_PLUGGED_USB || plugged == BatteryManager.BATTERY_PLUGGED_WIRELESS
+        val isProtected = isPlugged && status == BatteryManager.BATTERY_STATUS_NOT_CHARGING && batteryPct > 70
+
+        return mapOf(
+            "percentage" to batteryPct.toInt(),
+            "status" to statusStr,
+            "health" to healthStr,
+            "voltage" to if (voltage > 0) voltage else 0,
+            "temperature" to temperature / 10.0,
+            "technology" to technology,
+            "plugged" to pluggedStr,
+            "current" to kotlin.math.abs(currentMA),
+            "power" to String.format(Locale.US, "%.2f", kotlin.math.abs(powerWatt)),
+            "isProtected" to isProtected
+        )
     }
 
     private val projectionLauncher = registerForActivityResult(
@@ -149,6 +250,16 @@ class MainActivity : ComponentActivity() {
     ) { isGranted: Boolean ->
         if (isGranted) {
             startCamera()
+        }
+    }
+
+    private val requestLocationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        if (permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+            permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        ) {
+            startLocationUpdates()
         }
     }
 
@@ -172,6 +283,12 @@ class MainActivity : ComponentActivity() {
             requestPermissionLauncher.launch(Manifest.permission.CAMERA)
         } else {
             startCamera()
+        }
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            requestLocationPermissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+        } else {
+            startLocationUpdates()
         }
 
         if (android.os.Build.VERSION.SDK_INT >= 33) {
@@ -204,6 +321,8 @@ class MainActivity : ComponentActivity() {
         if (!favoritePaths.contains(currentServedPath)) favoritePaths.add(currentServedPath)
         if (!favoritePaths.contains(SCREEN_MIRROR_TAG)) favoritePaths.add(SCREEN_MIRROR_TAG)
         if (!favoritePaths.contains(NOTIFICATIONS_TAG)) favoritePaths.add(NOTIFICATIONS_TAG)
+        if (!favoritePaths.contains(GPS_TAG)) favoritePaths.add(GPS_TAG)
+        if (!favoritePaths.contains(BATTERY_TAG)) favoritePaths.add(BATTERY_TAG)
 
         if (!isNotificationServiceEnabled()) {
             try {
@@ -228,6 +347,8 @@ class MainActivity : ComponentActivity() {
                         when (newPath) {
                             SCREEN_MIRROR_TAG -> startScreenProjection()
                             NOTIFICATIONS_TAG -> startNotificationsServing()
+                            GPS_TAG -> startGpsServing()
+                            BATTERY_TAG -> startBatteryServing()
                             else -> {
                                 currentServedPath = newPath
                                 restartServer(newPath)
@@ -235,7 +356,7 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                     onToggleFavorite = { path ->
-                        if (path == SCREEN_MIRROR_TAG || path == NOTIFICATIONS_TAG) return@Android_viawebApp
+                        if (path == SCREEN_MIRROR_TAG || path == NOTIFICATIONS_TAG || path == GPS_TAG || path == BATTERY_TAG) return@Android_viawebApp
                         if (favoritePaths.contains(path)) {
                             if (path != defaultDir.absolutePath) {
                                 favoritePaths.remove(path)
@@ -262,6 +383,223 @@ class MainActivity : ComponentActivity() {
         currentServedPath = NOTIFICATIONS_TAG
     }
 
+    private fun startGpsServing() {
+        currentServedPath = GPS_TAG
+    }
+
+    private fun startBatteryServing() {
+        currentServedPath = BATTERY_TAG
+    }
+
+    private fun getSidebarHtml(): String {
+        val favoritesHtml = favoritePaths.joinToString("") { path ->
+            val label = when (path) {
+                SCREEN_MIRROR_TAG -> "Screen Mirror"
+                NOTIFICATIONS_TAG -> "Notifications"
+                GPS_TAG -> "GPS Tracker"
+                BATTERY_TAG -> "Battery Status"
+                else -> File(path).name.ifEmpty { "Root" }
+            }
+            val activeClass = if (path == currentServedPath) "active" else ""
+            """<div class="sidebar-item $activeClass" onclick="changeMode('$path')">$label</div>"""
+        }
+
+        return """
+            <div id="sidebar">
+                <div class="sidebar-header">Android via Web</div>
+                $favoritesHtml
+            </div>
+            <style>
+                #sidebar { width: 220px; height: 100vh; background: #2c3e50; color: white; position: fixed; left: 0; top: 0; overflow-y: auto; z-index: 1000; border-right: 1px solid #34495e; transition: transform 0.3s; }
+                .sidebar-header { padding: 20px; font-size: 1.2rem; font-weight: bold; background: #1a252f; text-align: center; }
+                .sidebar-item { padding: 15px 20px; cursor: pointer; border-bottom: 1px solid #34495e; transition: background 0.2s; font-size: 0.95rem; }
+                .sidebar-item:hover { background: #34495e; }
+                .sidebar-item.active { background: #3498db; border-left: 5px solid #2980b9; }
+                body { margin-left: 220px !important; transition: margin-left 0.3s; }
+                @media (max-width: 768px) {
+                    #sidebar { transform: translateX(-220px); }
+                    body { margin-left: 0 !important; }
+                    #sidebar.open { transform: translateX(0); }
+                    .sidebar-toggle { display: block !important; }
+                }
+                .sidebar-toggle { display: none; position: fixed; top: 10px; right: 10px; z-index: 1100; background: #2c3e50; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; font-size: 1.2rem; box-shadow: 0 2px 5px rgba(0,0,0,0.3); }
+            </style>
+            <button class="sidebar-toggle" onclick="document.getElementById('sidebar').classList.toggle('open')">☰ MENU</button>
+            <script>
+                async function changeMode(path) {
+                    try {
+                        const resp = await fetch('/api/change-mode?path=' + encodeURIComponent(path), { method: 'POST' });
+                        if (resp.ok) window.location.href = '/';
+                    } catch (e) { console.error(e); }
+                }
+            </script>
+        """.trimIndent()
+    }
+
+    private fun getWatchdogScript(mode: String): String {
+        return """
+            <script>
+                setInterval(async () => {
+                    try {
+                        const resp = await fetch('/api/current-mode');
+                        if (resp.ok) {
+                            const currentMode = await resp.text();
+                            if (currentMode !== "$mode") {
+                                window.location.href = '/';
+                            }
+                        }
+                    } catch (e) { }
+                }, 2000);
+            </script>
+        """.trimIndent()
+    }
+
+    private fun getBatteryHtml(): String {
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Battery Monitor</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <style>
+                    body { font-family: sans-serif; padding: 20px; background-color: #f8f9fa; color: #212529; }
+                    .card { background: white; padding: 25px; border-radius: 15px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 400px; margin: 0 auto; text-align: center; }
+                    h1 { color: #28a745; margin-bottom: 20px; }
+                    .battery-level { font-size: 3rem; font-weight: bold; margin: 15px 0; color: #333; }
+                    .battery-icon { font-size: 5rem; color: #28a745; }
+                    .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 25px; text-align: left; }
+                    .info-item { background: #f1f3f5; padding: 10px; border-radius: 8px; }
+                    .label { font-size: 0.8rem; color: #6c757d; display: block; }
+                    .val { font-weight: bold; font-size: 1rem; }
+                </style>
+            </head>
+            <body>
+                ${getSidebarHtml()}
+                <div class="card">
+                    <h1>Battery Status</h1>
+                    <div id="levelIcon" class="battery-icon">🔋</div>
+                    <div id="pct" class="battery-level">--%</div>
+                    <div id="status" style="font-size: 1.2rem; margin-bottom: 20px;">Loading...</div>
+                    <div class="info-grid">
+                        <div class="info-item"><span class="label">Health</span><span id="health" class="val">--</span></div>
+                        <div class="info-item"><span class="label">Temperature</span><span id="temp" class="val">--</span></div>
+                        <div class="info-item"><span class="label">Voltage</span><span id="volt" class="val">--</span></div>
+                        <div class="info-item"><span class="label">Source</span><span id="plug" class="val">--</span></div>
+                        <div class="info-item"><span class="label">Current</span><span id="curr" class="val">--</span></div>
+                        <div class="info-item"><span class="label">Power</span><span id="pow" class="val">--</span></div>
+                    </div>
+                    <div id="protectionWarn" style="margin-top: 20px; color: #d63301; font-weight: bold; display: none;">
+                        ⚠️ Charging Limit / Protection Active
+                    </div>
+                </div>
+                <script>
+                    function updateBattery() {
+                        fetch('/api/battery')
+                            .then(response => response.json())
+                            .then(data => {
+                                document.getElementById('pct').innerText = data.percentage + '%';
+                                document.getElementById('status').innerText = data.status;
+                                document.getElementById('health').innerText = data.health;
+                                document.getElementById('temp').innerText = data.temperature + ' °C';
+                                document.getElementById('volt').innerText = data.voltage + ' mV';
+                                document.getElementById('plug').innerText = data.plugged;
+                                document.getElementById('curr').innerText = data.current + ' mA';
+                                document.getElementById('pow').innerText = data.power + ' W';
+                                document.getElementById('protectionWarn').style.display = data.isProtected ? 'block' : 'none';
+                                
+                                const icon = document.getElementById('levelIcon');
+                                if (data.status === 'Charging') icon.innerText = '⚡';
+                                else if (data.percentage > 80) icon.innerText = '🔋';
+                                else if (data.percentage > 20) icon.innerText = '🪫';
+                                else icon.innerText = '⚠️';
+                            })
+                            .catch(err => console.error(err));
+                    }
+                    updateBattery();
+                    setInterval(updateBattery, 5000);
+                </script>
+                ${getWatchdogScript(BATTERY_TAG)}
+            </body>
+            </html>
+        """.trimIndent()
+    }
+
+    private fun getGpsHtml(): String {
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>GPS Tracker</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+                <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+                <style>
+                    body { font-family: sans-serif; padding: 20px; background-color: #f0f2f5; color: #1c1e21; }
+                    .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); max-width: 600px; margin: 0 auto; }
+                    h1 { color: #1877f2; text-align: center; margin-bottom: 25px; }
+                    .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+                    .data-row { display: flex; flex-direction: column; padding: 10px; background: #f8f9fa; border-radius: 8px; }
+                    .label { font-weight: bold; color: #65676b; font-size: 0.8rem; }
+                    .value { font-family: monospace; color: #050505; font-size: 1rem; }
+                    #map { height: 300px; width: 100%; border-radius: 12px; margin-top: 20px; border: 1px solid #ddd; }
+                    .map-link { display: block; text-align: center; margin-top: 20px; padding: 12px; background: #1877f2; color: white; text-decoration: none; border-radius: 8px; font-weight: bold; }
+                </style>
+            </head>
+            <body>
+                ${getSidebarHtml()}
+                <div class="card">
+                    <h1>Live GPS Data</h1>
+                    <div class="data-grid">
+                        <div class="data-row"><span class="label">Latitude</span><span class="value" id="lat">--</span></div>
+                        <div class="data-row"><span class="label">Longitude</span><span class="value" id="lng">--</span></div>
+                        <div class="data-row"><span class="label">Altitude</span><span class="value" id="alt">--</span></div>
+                        <div class="data-row"><span class="label">Speed</span><span class="value" id="spd">--</span></div>
+                        <div class="data-row"><span class="label">Accuracy</span><span class="value" id="acc">--</span></div>
+                        <div class="data-row"><span class="label">Last Update</span><span class="value" id="time">--</span></div>
+                    </div>
+                    <div id="map"></div>
+                    <a id="mapLink" href="#" target="_blank" class="map-link">Open in Google Maps</a>
+                </div>
+                <script>
+                    let map, marker;
+                    function initMap() {
+                        map = L.map('map').setView([0, 0], 2);
+                        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                            attribution: '© OpenStreetMap contributors'
+                        }).addTo(map);
+                        marker = L.marker([0, 0]).addTo(map);
+                    }
+                    function updateGps() {
+                        fetch('/api/gps')
+                            .then(response => response.json())
+                            .then(data => {
+                                if (data.error) return;
+                                const lat = data.latitude;
+                                const lng = data.longitude;
+                                document.getElementById('lat').innerText = lat.toFixed(6);
+                                document.getElementById('lng').innerText = lng.toFixed(6);
+                                document.getElementById('alt').innerText = data.altitude.toFixed(2) + ' m';
+                                document.getElementById('spd').innerText = (data.speed * 3.6).toFixed(1) + ' km/h';
+                                document.getElementById('acc').innerText = data.accuracy.toFixed(1) + ' m';
+                                document.getElementById('time').innerText = new Date(data.time).toLocaleTimeString();
+                                document.getElementById('mapLink').href = `https://www.google.com/maps?q=${"$"}{lat},${"$"}{lng}`;
+                                
+                                if (!map) initMap();
+                                const pos = [lat, lng];
+                                map.setView(pos, 15);
+                                marker.setLatLng(pos);
+                            })
+                            .catch(err => console.error(err));
+                    }
+                    updateGps();
+                    setInterval(updateGps, 3000);
+                </script>
+                ${getWatchdogScript(GPS_TAG)}
+            </body>
+            </html>
+        """.trimIndent()
+    }
+
     private fun getProjectionHtml(): String {
         return """
             <!DOCTYPE html>
@@ -270,25 +608,41 @@ class MainActivity : ComponentActivity() {
                 <title>Phone Screen Mirror</title>
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <style>
-                    body { font-family: sans-serif; margin: 0; background-color: #000; color: white; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
-                    #stream { width: 100vw; height: 100vh; object-fit: contain; }
-                    .overlay { position: absolute; bottom: 10px; right: 10px; background: rgba(0,0,0,0.5); padding: 8px 20px; border-radius: 20px; font-size: 0.9rem; z-index: 100; opacity: 0.7; }
-                    .res-controls { position: absolute; top: 15px; left: 15px; display: flex; gap: 10px; z-index: 100; }
-                    .res-btn { background: rgba(0,0,0,0.6); border: 2px solid white; color: white; padding: 15px 25px; border-radius: 10px; cursor: pointer; font-size: 1.1rem; font-weight: bold; transition: all 0.2s; }
+                    body { font-family: sans-serif; margin: 0; background-color: #000; color: white; height: 100%; width: 100%; overflow: hidden; position: fixed; }
+                    #stream { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; }
+                    .overlay { position: absolute; bottom: 10px; right: 10px; background: rgba(0,0,0,0.5); padding: 8px 20px; border-radius: 20px; font-size: 0.9rem; z-index: 100; opacity: 0.7; pointer-events: none; }
+                    .res-controls { position: absolute; top: 15px; left: 15px; display: flex; gap: 10px; z-index: 100; flex-wrap: wrap; max-width: 90vw; }
+                    .res-btn { background: rgba(0,0,0,0.6); border: 2px solid white; color: white; padding: 12px 20px; border-radius: 10px; cursor: pointer; font-size: 1rem; font-weight: bold; transition: all 0.2s; white-space: nowrap; }
                     .res-btn:hover { background: rgba(255,255,255,0.2); transform: scale(1.05); }
                     .res-btn.active { background: #2196F3; border-color: #2196F3; box-shadow: 0 0 15px rgba(33, 150, 243, 0.5); }
                 </style>
             </head>
             <body>
+                ${getSidebarHtml()}
+                <img id="stream" src="/api/projection" alt="Screen Mirror">
                 <div class="res-controls">
                     <button class="res-btn" onclick="setRes(426, 240, this)">240p</button>
                     <button class="res-btn active" onclick="setRes(640, 360, this)">360p</button>
                     <button class="res-btn" onclick="setRes(854, 480, this)">480p</button>
                     <button class="res-btn" onclick="setRes(1280, 720, this)">720p</button>
+                    <button class="res-btn" style="background: #f44336;" onclick="rotateScreen()">🔄 ROTATE</button>
                 </div>
                 <div class="overlay">Screen Mirror Mode</div>
-                <img id="stream" src="/api/projection" alt="Screen Mirror">
                 <script>
+                    async function rotateScreen() {
+                        try {
+                            const response = await fetch('/api/rotate-screen', { method: 'POST' });
+                            const data = await response.json();
+                            if (data.error) alert(data.error);
+                            else {
+                                // Reloading stream might be needed to adapt to new aspect ratio
+                                setTimeout(() => {
+                                    const stream = document.getElementById('stream');
+                                    stream.src = '/api/projection?t=' + new Date().getTime();
+                                }, 1000);
+                            }
+                        } catch (e) { console.error(e); }
+                    }
                     async function setRes(w, h, btn) {
                         try {
                             await fetch(`/api/projection-res?w=${"$"}{w}&h=${"$"}{h}`, { method: 'POST' });
@@ -300,6 +654,7 @@ class MainActivity : ComponentActivity() {
                         setTimeout(() => { this.src = '/api/projection?t=' + new Date().getTime(); }, 1000);
                     };
                 </script>
+                ${getWatchdogScript(SCREEN_MIRROR_TAG)}
             </body>
             </html>
         """.trimIndent()
@@ -322,6 +677,7 @@ class MainActivity : ComponentActivity() {
                 </style>
             </head>
             <body>
+                ${getSidebarHtml()}
                 <h1>Last 10 Notifications</h1>
                 <div id="notifications">Loading...</div>
                 <script>
@@ -346,6 +702,7 @@ class MainActivity : ComponentActivity() {
                     fetchNotifications();
                     setInterval(fetchNotifications, 5000);
                 </script>
+                ${getWatchdogScript(NOTIFICATIONS_TAG)}
             </body>
             </html>
         """.trimIndent()
@@ -471,6 +828,7 @@ class MainActivity : ComponentActivity() {
                 </style>
             </head>
             <body>
+                ${getSidebarHtml()}
                 <div id="welcome" class="welcome-msg"><h1>REMOTE CAMERA</h1><p>Ready to capture</p></div>
                 <div id="loading" class="loading">CAPTURING...</div>
                 <div class="timeout-container">
@@ -544,6 +902,7 @@ class MainActivity : ComponentActivity() {
                         input.value = '';
                     }
                 </script>
+                ${getWatchdogScript(currentServedPath)}
             </body>
             </html>
         """.trimIndent()
@@ -641,16 +1000,80 @@ class MainActivity : ComponentActivity() {
                     call.respondText("{\"status\": \"updated\"}", ContentType.Application.Json)
                 }
 
+                post("/api/rotate-screen") {
+                    if (Settings.System.canWrite(this@MainActivity)) {
+                        try {
+                            val currentRotation = Settings.System.getInt(contentResolver, Settings.System.USER_ROTATION, Surface.ROTATION_0)
+                            val nextRotation = (currentRotation + 1) % 4
+                            Settings.System.putInt(contentResolver, Settings.System.ACCELEROMETER_ROTATION, 0)
+                            Settings.System.putInt(contentResolver, Settings.System.USER_ROTATION, nextRotation)
+                            call.respondText("{\"status\": \"rotated\", \"value\": $nextRotation}", ContentType.Application.Json)
+                        } catch (e: Exception) {
+                            call.respond(HttpStatusCode.InternalServerError, "{\"error\": \"${e.message}\"}")
+                        }
+                    } else {
+                        call.respond(HttpStatusCode.Forbidden, "{\"error\": \"Write Settings permission not granted\"}")
+                    }
+                }
+
                 get("/api/notifications") {
                     val list = NotificationReceiverService.notifications
                     val json = Gson().toJson(list)
                     call.respondText(json, ContentType.Application.Json)
                 }
 
+                get("/api/current-mode") {
+                    call.respondText(currentServedPath)
+                }
+
+                post("/api/change-mode") {
+                    val path = call.request.queryParameters["path"] ?: return@post call.respond(HttpStatusCode.BadRequest)
+                    runOnUiThread {
+                        if (path != SCREEN_MIRROR_TAG && currentServedPath == SCREEN_MIRROR_TAG) {
+                            stopService(Intent(this@MainActivity, ProjectionService::class.java))
+                        }
+                        when (path) {
+                            SCREEN_MIRROR_TAG -> startScreenProjection()
+                            NOTIFICATIONS_TAG -> startNotificationsServing()
+                            GPS_TAG -> startGpsServing()
+                            BATTERY_TAG -> startBatteryServing()
+                            else -> {
+                                currentServedPath = path
+                                restartServer(path)
+                            }
+                        }
+                    }
+                    call.respondText("OK")
+                }
+
+                get("/api/gps") {
+                    val loc = lastLocation
+                    if (loc != null) {
+                        val map = mapOf(
+                            "latitude" to loc.latitude,
+                            "longitude" to loc.longitude,
+                            "altitude" to loc.altitude,
+                            "speed" to loc.speed,
+                            "accuracy" to loc.accuracy,
+                            "time" to loc.time
+                        )
+                        call.respondText(Gson().toJson(map), ContentType.Application.Json)
+                    } else {
+                        call.respondText("{\"error\": \"Waiting for GPS signal...\"}", ContentType.Application.Json)
+                    }
+                }
+
+                get("/api/battery") {
+                    val info = getBatteryInfo()
+                    call.respondText(Gson().toJson(info), ContentType.Application.Json)
+                }
+
                 get("/") {
                     when (currentServedPath) {
                         SCREEN_MIRROR_TAG -> call.respondText(getProjectionHtml(), ContentType.Text.Html)
                         NOTIFICATIONS_TAG -> call.respondText(getNotificationsHtml(), ContentType.Text.Html)
+                        GPS_TAG -> call.respondText(getGpsHtml(), ContentType.Text.Html)
+                        BATTERY_TAG -> call.respondText(getBatteryHtml(), ContentType.Text.Html)
                         else -> {
                             val indexHtml = File(dir, "index.html")
                             if (indexHtml.exists()) call.respondFile(indexHtml)
@@ -668,6 +1091,8 @@ class MainActivity : ComponentActivity() {
                         when (currentServedPath) {
                             SCREEN_MIRROR_TAG -> { call.respondText(getProjectionHtml(), ContentType.Text.Html); return@get }
                             NOTIFICATIONS_TAG -> { call.respondText(getNotificationsHtml(), ContentType.Text.Html); return@get }
+                            GPS_TAG -> { call.respondText(getGpsHtml(), ContentType.Text.Html); return@get }
+                            BATTERY_TAG -> { call.respondText(getBatteryHtml(), ContentType.Text.Html); return@get }
                         }
                     }
                     val requestedFile = File(dir, relativePath)
@@ -695,13 +1120,16 @@ class MainActivity : ComponentActivity() {
             append("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">")
             append("<style>body{font-family:sans-serif;padding:20px;} li{margin:10px 0;} a{text-decoration:none;color:#007bff;} a:hover{text-decoration:underline;}</style>")
             append("</head><body>")
+            append(getSidebarHtml())
             append("<h1>Index of /$relativePath</h1><hr><ul>")
             if (relativePath.isNotEmpty()) append("<li><a href=\"..\">.. (Parent Directory)</a></li>")
             files.forEach { file ->
                 val name = file.name + (if (file.isDirectory) "/" else "")
                 append("<li><a href=\"$name\">$name</a></li>")
             }
-            append("</ul><hr></body></html>")
+            append("</ul><hr>")
+            append(getWatchdogScript(currentServedPath))
+            append("</body></html>")
         }
     }
 
@@ -803,6 +1231,8 @@ fun HomeScreen(serverUrl: String, currentServedPath: String, padding: androidx.c
             text = when(currentServedPath) {
                 SCREEN_MIRROR_TAG -> "Screen Mirroring Active"
                 NOTIFICATIONS_TAG -> "Notifications Display Active"
+                GPS_TAG -> "GPS Tracking Active"
+                BATTERY_TAG -> "Battery Monitor Active"
                 else -> "Serving: $currentServedPath"
             },
             style = MaterialTheme.typography.bodyMedium,
@@ -831,6 +1261,8 @@ fun FavoritesScreen(
                         imageVector = when(path) {
                             SCREEN_MIRROR_TAG -> Icons.Default.Favorite
                             NOTIFICATIONS_TAG -> Icons.Default.Notifications
+                            GPS_TAG -> Icons.Default.LocationOn
+                            BATTERY_TAG -> Icons.Default.BatteryFull
                             else -> Icons.Default.Folder
                         },
                         contentDescription = null,
@@ -842,6 +1274,8 @@ fun FavoritesScreen(
                             text = when(path) {
                                 SCREEN_MIRROR_TAG -> "Screen Mirror"
                                 NOTIFICATIONS_TAG -> "Notifications"
+                                GPS_TAG -> "GPS Tracker"
+                                BATTERY_TAG -> "Battery Status"
                                 else -> File(path).name.ifEmpty { "Root" }
                             },
                             style = MaterialTheme.typography.bodyLarge
@@ -850,6 +1284,8 @@ fun FavoritesScreen(
                             text = when(path) {
                                 SCREEN_MIRROR_TAG -> "Live Web Projection"
                                 NOTIFICATIONS_TAG -> "Last 10 Notifications"
+                                GPS_TAG -> "Live Position Data"
+                                BATTERY_TAG -> "Level and Health Info"
                                 else -> path
                             },
                             style = MaterialTheme.typography.bodySmall

@@ -78,7 +78,7 @@ class ProjectionService : Service() {
         backgroundThread = HandlerThread("ProjectionThread").also { it.start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
 
-        setupVirtualDisplay(640, 360)
+        setupVirtualDisplay(640)
     }
 
     private fun updateResolution(width: Int, height: Int) {
@@ -87,12 +87,31 @@ class ProjectionService : Service() {
         virtualDisplay?.release()
         imageReader?.close()
         
-        setupVirtualDisplay(width, height)
+        // We use the larger dimension as the reference for quality
+        setupVirtualDisplay(maxOf(width, height))
     }
 
-    private fun setupVirtualDisplay(width: Int, height: Int) {
+    private fun setupVirtualDisplay(targetSize: Int) {
         val metrics = resources.displayMetrics
+        val screenWidth = metrics.widthPixels
+        val screenHeight = metrics.heightPixels
         val density = metrics.densityDpi
+
+        // Calculate aspect ratio and adapt requested resolution to match the device screen
+        val ratio = screenWidth.toFloat() / screenHeight.toFloat()
+        
+        val width: Int
+        val height: Int
+        
+        if (screenWidth > screenHeight) {
+            // Landscape device: use targetSize as the long side (width)
+            width = targetSize
+            height = (targetSize / ratio).toInt()
+        } else {
+            // Portrait device: use targetSize as the long side (height)
+            height = targetSize
+            width = (height * ratio).toInt()
+        }
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         virtualDisplay = mediaProjection?.createVirtualDisplay(
