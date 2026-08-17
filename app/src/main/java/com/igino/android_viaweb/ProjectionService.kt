@@ -15,7 +15,6 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 
@@ -30,7 +29,7 @@ class ProjectionService : Service() {
         const val CHANNEL_ID = "ProjectionServiceChannel"
         const val NOTIFICATION_ID = 101
         
-        // Static frame access for the server
+        @Volatile
         var lastFrame: ByteArray? = null
     }
 
@@ -38,16 +37,12 @@ class ProjectionService : Service() {
         super.onCreate()
         createNotificationChannel()
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Android Auto Web Stream")
-            .setContentText("Streaming virtual display...")
+            .setContentTitle("Screen Mirroring Active")
+            .setContentText("Streaming phone screen to web...")
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .build()
         
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
+        startForeground(NOTIFICATION_ID, notification)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -61,26 +56,47 @@ class ProjectionService : Service() {
 
         if (resultData != null) {
             startProjection(resultCode, resultData)
+        } else {
+            val newWidth = intent?.getIntExtra("width", 640) ?: 640
+            val newHeight = intent?.getIntExtra("height", 360) ?: 360
+            updateResolution(newWidth, newHeight)
         }
 
         return START_NOT_STICKY
     }
 
+    private var currentResultCode: Int = -1
+    private var currentResultData: Intent? = null
+
     private fun startProjection(resultCode: Int, resultData: Intent) {
+        currentResultCode = resultCode
+        currentResultData = resultData
+        
         val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjection = mpManager.getMediaProjection(resultCode, resultData)
 
         backgroundThread = HandlerThread("ProjectionThread").also { it.start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
 
+        setupVirtualDisplay(640, 360)
+    }
+
+    private fun updateResolution(width: Int, height: Int) {
+        if (mediaProjection == null) return
+        
+        virtualDisplay?.release()
+        imageReader?.close()
+        
+        setupVirtualDisplay(width, height)
+    }
+
+    private fun setupVirtualDisplay(width: Int, height: Int) {
         val metrics = resources.displayMetrics
-        val width = 1280
-        val height = 720
         val density = metrics.densityDpi
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         virtualDisplay = mediaProjection?.createVirtualDisplay(
-            "AndroidAutoDisplay",
+            "MirrorDisplay",
             width, height, density,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader?.surface, null, backgroundHandler
@@ -103,7 +119,7 @@ class ProjectionService : Service() {
                 bitmap.copyPixelsFromBuffer(buffer)
                 
                 val out = ByteArrayOutputStream()
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 70, out)
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 40, out)
                 lastFrame = out.toByteArray()
                 bitmap.recycle()
             } catch (e: Exception) {
@@ -117,7 +133,7 @@ class ProjectionService : Service() {
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val serviceChannel = NotificationChannel(
-                CHANNEL_ID, "Projection Service Channel",
+                CHANNEL_ID, "Screen Mirror Channel",
                 NotificationManager.IMPORTANCE_LOW
             )
             val manager = getSystemService(NotificationManager::class.java)
@@ -132,6 +148,7 @@ class ProjectionService : Service() {
         mediaProjection?.stop()
         imageReader?.close()
         backgroundThread?.quitSafely()
+        lastFrame = null
         super.onDestroy()
     }
 }

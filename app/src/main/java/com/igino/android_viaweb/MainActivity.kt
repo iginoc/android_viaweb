@@ -12,6 +12,7 @@ import android.graphics.YuvImage
 import android.hardware.camera2.*
 import android.content.Context
 import android.content.pm.PackageManager
+import android.content.ComponentName
 import android.media.ImageReader
 import android.media.projection.MediaProjectionManager
 import android.os.Handler
@@ -46,6 +47,7 @@ import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -68,6 +70,7 @@ import com.igino.android_viaweb.ui.theme.Android_viawebTheme
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import androidx.compose.ui.tooling.preview.Preview
+import com.google.gson.Gson
 import io.ktor.server.engine.*
 import io.ktor.server.netty.*
 import io.ktor.server.routing.*
@@ -76,7 +79,12 @@ import io.ktor.server.request.*
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.*
+import io.ktor.server.request.*
+import io.ktor.server.response.*
+import io.ktor.http.content.*
 import io.ktor.utils.io.*
+import android.app.WallpaperManager
+import android.graphics.BitmapFactory
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -89,6 +97,9 @@ import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.system.exitProcess
 
+private const val SCREEN_MIRROR_TAG = "INTERNAL://SCREEN_MIRROR"
+private const val NOTIFICATIONS_TAG = "INTERNAL://NOTIFICATIONS"
+
 class MainActivity : ComponentActivity() {
     private var server: EmbeddedServer<*, *>? = null
     private var currentServedPath by mutableStateOf("")
@@ -97,15 +108,29 @@ class MainActivity : ComponentActivity() {
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var cameraImageReader: ImageReader? = null
+    private var previewImageReader: ImageReader? = null
     private var backgroundHandler: Handler? = null
     private var backgroundThread: HandlerThread? = null
     private var cameraManager: CameraManager? = null
     private var cameraId: String? = null
 
     private var photoDeferred: CompletableDeferred<File>? = null
+    private var lastPhotoFile: File? = null
     private val favoritePaths = mutableStateListOf<String>()
+    private lateinit var favoritesManager: FavoritesManager
 
-    private val ANDROID_AUTO_TAG = "INTERNAL://ANDROID_AUTO"
+    private fun isNotificationServiceEnabled(): Boolean {
+        val pkgName = packageName
+        val flat = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+        if (!flat.isNullOrEmpty()) {
+            val names = flat.split(":")
+            for (name in names) {
+                val cn = ComponentName.unflattenFromString(name)
+                if (cn != null && pkgName == cn.packageName) return true
+            }
+        }
+        return false
+    }
 
     private val projectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -116,16 +141,6 @@ class MainActivity : ComponentActivity() {
                 putExtra("resultData", result.data)
             }
             ContextCompat.startForegroundService(this, serviceIntent)
-            
-            // Try to enable car mode if Android Auto is the goal
-            val uiModeManager = getSystemService(Context.UI_MODE_SERVICE) as android.app.UiModeManager
-            uiModeManager.enableCarMode(0)
-            
-            // Try to launch Android Auto if possible
-            try {
-                val aaIntent = packageManager.getLaunchIntentForPackage("com.google.android.projection.gearhead")
-                if (aaIntent != null) startActivity(aaIntent)
-            } catch (e: Exception) { e.printStackTrace() }
         }
     }
 
@@ -159,6 +174,12 @@ class MainActivity : ComponentActivity() {
             startCamera()
         }
 
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            if (ContextCompat.checkSelfPermission(this, "android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                registerForActivityResult(ActivityResultContracts.RequestPermission()) {}.launch("android.permission.POST_NOTIFICATIONS")
+            }
+        }
+
         if (!Settings.System.canWrite(this)) {
             try {
                 val intent = Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS)
@@ -173,9 +194,22 @@ class MainActivity : ComponentActivity() {
         val defaultDir = File(downloadDir, "serverweb")
         if (!defaultDir.exists()) defaultDir.mkdirs()
         currentServedPath = defaultDir.absolutePath
-        
+
+        favoritesManager = FavoritesManager(this)
+        val loadedFavorites = favoritesManager.loadFavorites()
+        favoritePaths.clear()
+        if (loadedFavorites.isNotEmpty()) {
+            favoritePaths.addAll(loadedFavorites)
+        }
         if (!favoritePaths.contains(currentServedPath)) favoritePaths.add(currentServedPath)
-        if (!favoritePaths.contains(ANDROID_AUTO_TAG)) favoritePaths.add(ANDROID_AUTO_TAG)
+        if (!favoritePaths.contains(SCREEN_MIRROR_TAG)) favoritePaths.add(SCREEN_MIRROR_TAG)
+        if (!favoritePaths.contains(NOTIFICATIONS_TAG)) favoritePaths.add(NOTIFICATIONS_TAG)
+
+        if (!isNotificationServiceEnabled()) {
+            try {
+                startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
+            } catch (e: Exception) { e.printStackTrace() }
+        }
 
         createDefaultIndexHtml(defaultDir)
         startServer(currentServedPath)
@@ -187,19 +221,29 @@ class MainActivity : ComponentActivity() {
                     currentServedPath = currentServedPath,
                     favoritePaths = favoritePaths,
                     onPathChanged = { newPath ->
-                        if (newPath == ANDROID_AUTO_TAG) {
-                            startAndroidAutoProjection()
-                        } else {
-                            currentServedPath = newPath
-                            restartServer(newPath)
+                        if (newPath != SCREEN_MIRROR_TAG && currentServedPath == SCREEN_MIRROR_TAG) {
+                            stopService(Intent(this, ProjectionService::class.java))
+                        }
+                        
+                        when (newPath) {
+                            SCREEN_MIRROR_TAG -> startScreenProjection()
+                            NOTIFICATIONS_TAG -> startNotificationsServing()
+                            else -> {
+                                currentServedPath = newPath
+                                restartServer(newPath)
+                            }
                         }
                     },
                     onToggleFavorite = { path ->
-                        if (path == ANDROID_AUTO_TAG) return@Android_viawebApp
+                        if (path == SCREEN_MIRROR_TAG || path == NOTIFICATIONS_TAG) return@Android_viawebApp
                         if (favoritePaths.contains(path)) {
-                            if (path != defaultDir.absolutePath) favoritePaths.remove(path)
+                            if (path != defaultDir.absolutePath) {
+                                favoritePaths.remove(path)
+                                favoritesManager.saveFavorites(favoritePaths)
+                            }
                         } else {
                             favoritePaths.add(path)
+                            favoritesManager.saveFavorites(favoritePaths)
                         }
                     },
                     onExit = { exitApp() }
@@ -208,29 +252,50 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startAndroidAutoProjection() {
+    private fun startScreenProjection() {
         val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projectionLauncher.launch(mpManager.createScreenCaptureIntent())
-        
-        // Update web page for projection mode
-        val dir = File(currentServedPath)
-        val indexFile = File(dir, "index.html")
-        val projectionHtml = """
+        currentServedPath = SCREEN_MIRROR_TAG
+    }
+
+    private fun startNotificationsServing() {
+        currentServedPath = NOTIFICATIONS_TAG
+    }
+
+    private fun getProjectionHtml(): String {
+        return """
             <!DOCTYPE html>
             <html>
             <head>
-                <title>Android Auto Stream</title>
+                <title>Phone Screen Mirror</title>
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <style>
                     body { font-family: sans-serif; margin: 0; background-color: #000; color: white; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
                     #stream { width: 100vw; height: 100vh; object-fit: contain; }
-                    .overlay { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.5); padding: 5px 15px; border-radius: 20px; font-size: 0.8rem; }
+                    .overlay { position: absolute; bottom: 10px; right: 10px; background: rgba(0,0,0,0.5); padding: 8px 20px; border-radius: 20px; font-size: 0.9rem; z-index: 100; opacity: 0.7; }
+                    .res-controls { position: absolute; top: 15px; left: 15px; display: flex; gap: 10px; z-index: 100; }
+                    .res-btn { background: rgba(0,0,0,0.6); border: 2px solid white; color: white; padding: 15px 25px; border-radius: 10px; cursor: pointer; font-size: 1.1rem; font-weight: bold; transition: all 0.2s; }
+                    .res-btn:hover { background: rgba(255,255,255,0.2); transform: scale(1.05); }
+                    .res-btn.active { background: #2196F3; border-color: #2196F3; box-shadow: 0 0 15px rgba(33, 150, 243, 0.5); }
                 </style>
             </head>
             <body>
-                <div class="overlay">Android Auto Mode</div>
-                <img id="stream" src="/api/projection" alt="Auto Stream">
+                <div class="res-controls">
+                    <button class="res-btn" onclick="setRes(426, 240, this)">240p</button>
+                    <button class="res-btn active" onclick="setRes(640, 360, this)">360p</button>
+                    <button class="res-btn" onclick="setRes(854, 480, this)">480p</button>
+                    <button class="res-btn" onclick="setRes(1280, 720, this)">720p</button>
+                </div>
+                <div class="overlay">Screen Mirror Mode</div>
+                <img id="stream" src="/api/projection" alt="Screen Mirror">
                 <script>
+                    async function setRes(w, h, btn) {
+                        try {
+                            await fetch(`/api/projection-res?w=${"$"}{w}&h=${"$"}{h}`, { method: 'POST' });
+                            document.querySelectorAll('.res-btn').forEach(b => b.classList.remove('active'));
+                            btn.classList.add('active');
+                        } catch (e) { console.error(e); }
+                    }
                     document.getElementById('stream').onerror = function() {
                         setTimeout(() => { this.src = '/api/projection?t=' + new Date().getTime(); }, 1000);
                     };
@@ -238,8 +303,52 @@ class MainActivity : ComponentActivity() {
             </body>
             </html>
         """.trimIndent()
-        indexFile.writeText(projectionHtml)
-        currentServedPath = ANDROID_AUTO_TAG
+    }
+
+    private fun getNotificationsHtml(): String {
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Smartphone Notifications</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <style>
+                    body { font-family: sans-serif; padding: 20px; background-color: #f4f4f9; color: #333; }
+                    .notification { background: white; padding: 15px; margin-bottom: 10px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                    .title { font-weight: bold; font-size: 1.1rem; color: #007bff; }
+                    .text { margin-top: 5px; color: #555; }
+                    .meta { font-size: 0.8rem; color: #888; margin-top: 10px; }
+                    h1 { text-align: center; color: #333; }
+                </style>
+            </head>
+            <body>
+                <h1>Last 10 Notifications</h1>
+                <div id="notifications">Loading...</div>
+                <script>
+                    function fetchNotifications() {
+                        fetch('/api/notifications')
+                            .then(response => response.json())
+                            .then(data => {
+                                const container = document.getElementById('notifications');
+                                container.innerHTML = data.length === 0 ? '<p>No notifications received yet.</p>' :
+                                    data.map(n => `
+                                    <div class="notification">
+                                        <div class="title">${"$"}{n.title || 'No Title'}</div>
+                                        <div class="text">${"$"}{n.text || ''}</div>
+                                        <div class="meta">${"$"}{n.packageName} • ${"$"}{new Date(n.timestamp).toLocaleString()}</div>
+                                    </div>
+                                `).join('');
+                            })
+                            .catch(err => {
+                                document.getElementById('notifications').innerHTML = 'Error loading notifications: ' + err;
+                            });
+                    }
+                    fetchNotifications();
+                    setInterval(fetchNotifications, 5000);
+                </script>
+            </body>
+            </html>
+        """.trimIndent()
     }
 
     private fun exitApp() {
@@ -248,6 +357,7 @@ class MainActivity : ComponentActivity() {
         captureSession?.close()
         cameraDevice?.close()
         cameraImageReader?.close()
+        previewImageReader?.close()
         backgroundThread?.quitSafely()
         finishAffinity()
         exitProcess(0)
@@ -257,6 +367,7 @@ class MainActivity : ComponentActivity() {
         if (cameraId == null) return
         backgroundThread = HandlerThread("CameraBackground").also { it.start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
+        
         cameraImageReader = ImageReader.newInstance(1920, 1080, ImageFormat.JPEG, 2)
         cameraImageReader?.setOnImageAvailableListener({ reader ->
             val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
@@ -274,13 +385,18 @@ class MainActivity : ComponentActivity() {
             } finally { image.close() }
         }, backgroundHandler)
 
+        previewImageReader = ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 2)
+        previewImageReader?.setOnImageAvailableListener({ reader ->
+            reader.acquireLatestImage()?.close()
+        }, backgroundHandler)
+
         try {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
                 cameraManager?.openCamera(cameraId!!, object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
                         cameraDevice = camera
-                        val surface = cameraImageReader!!.surface
-                        camera.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
+                        val surfaces = listOf(cameraImageReader!!.surface, previewImageReader!!.surface)
+                        camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
                             override fun onConfigured(session: CameraCaptureSession) {
                                 captureSession = session
                                 updateCaptureRequest()
@@ -300,7 +416,7 @@ class MainActivity : ComponentActivity() {
         val session = captureSession ?: return
         try {
             val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            builder.addTarget(cameraImageReader!!.surface)
+            builder.addTarget(previewImageReader!!.surface)
             builder.set(CaptureRequest.FLASH_MODE, if (isFlashlightOn) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
             session.setRepeatingRequest(builder.build(), null, backgroundHandler)
         } catch (e: Exception) { e.printStackTrace() }
@@ -342,6 +458,10 @@ class MainActivity : ComponentActivity() {
                     .btn-download { background-color: #2196F3; color: #fff; min-width: 140px; display: none; }
                     .btn-torch { background-color: #333; color: #fff; min-width: 110px; border: 1px solid #444; }
                     .btn-torch.active { background-color: #ffc107; color: #000; border-color: #ffc107; }
+                    .btn-wallpaper { background-color: #4CAF50; color: white; display: none; }
+                    .upload-section { position: absolute; top: 130px; left: 0; right: 0; display: flex; flex-direction: column; align-items: center; z-index: 100; gap: 10px; }
+                    .btn-upload { background-color: #9C27B0; color: white; padding: 10px 20px; border-radius: 20px; font-size: 0.8rem; }
+                    #fileInput { display: none; }
                     #fullScreenImage { width: 100vw; height: 100vh; object-fit: contain; display: none; background-color: #000; }
                     .welcome-msg { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; width: 100%; }
                     .loading { display: none; position: absolute; top: 30px; left: 50%; transform: translateX(-50%); background: rgba(255,255,255,0.9); color: #000; padding: 12px 25px; border-radius: 30px; font-weight: bold; z-index: 200; }
@@ -357,10 +477,15 @@ class MainActivity : ComponentActivity() {
                     <div class="timeout-label">Screen Timeout: <span id="timeoutVal">1</span> min</div>
                     <input type="range" min="0" max="30" value="1" id="timeoutSlider" oninput="updateTimeout(this.value)">
                 </div>
+                <div class="upload-section">
+                    <input type="file" id="fileInput" accept="image/*" onchange="uploadWallpaper(this)">
+                    <button class="btn-upload" onclick="document.getElementById('fileInput').click()">UPLOAD & SET WALLPAPER</button>
+                </div>
                 <img id="fullScreenImage">
                 <div class="controls">
                     <button id="torchBtn" class="btn-torch" onclick="toggleFlashlight()">TORCH: OFF</button>
                     <button class="btn-photo" onclick="capturePhoto()">TAKE PHOTO</button>
+                    <button id="setWallpaperBtn" class="btn-wallpaper btn-link" onclick="setWallpaperFromPhoto()">SET AS WALLPAPER</button>
                     <a id="downloadBtn" href="#" download="capture.jpg" class="btn-link btn-download">DOWNLOAD</a>
                 </div>
                 <script>
@@ -379,7 +504,8 @@ class MainActivity : ComponentActivity() {
                         try { await fetch('/api/screen-timeout?minutes=' + val, { method: 'POST' }); } catch (e) { console.error(e); }
                     }
                     async function capturePhoto() {
-                        document.getElementById('loading').style.display = 'block';
+                        const loader = document.getElementById('loading');
+                        loader.style.display = 'block';
                         try {
                             const response = await fetch('/api/take-photo', { method: 'POST' });
                             const data = await response.json();
@@ -389,9 +515,33 @@ class MainActivity : ComponentActivity() {
                                 document.getElementById('fullScreenImage').style.display = 'block';
                                 document.getElementById('downloadBtn').href = currentImageUrl;
                                 document.getElementById('downloadBtn').style.display = 'flex';
+                                document.getElementById('setWallpaperBtn').style.display = 'flex';
                                 document.getElementById('welcome').style.display = 'none';
                             }
-                        } catch (e) { alert('Error taking photo'); } finally { document.getElementById('loading').style.display = 'none'; }
+                        } catch (e) { alert('Error taking photo'); } finally { loader.style.display = 'none'; }
+                    }
+                    async function setWallpaperFromPhoto() {
+                        try {
+                            const response = await fetch('/api/set-wallpaper-last', { method: 'POST' });
+                            const data = await response.json();
+                            if (data.status === 'success') alert('Wallpaper set!');
+                            else alert('Error: ' + data.error);
+                        } catch (e) { alert('Error setting wallpaper'); }
+                    }
+                    async function uploadWallpaper(input) {
+                        if (!input.files || !input.files[0]) return;
+                        const formData = new FormData();
+                        formData.append('image', input.files[0]);
+                        try {
+                            const response = await fetch('/api/set-wallpaper-upload', {
+                                method: 'POST',
+                                body: formData
+                            });
+                            const data = await response.json();
+                            if (data.status === 'success') alert('Wallpaper set from upload!');
+                            else alert('Error: ' + data.error);
+                        } catch (e) { alert('Error uploading wallpaper'); }
+                        input.value = '';
                     }
                 </script>
             </body>
@@ -421,8 +571,44 @@ class MainActivity : ComponentActivity() {
                 post("/api/take-photo") {
                     try {
                         val photoFile = takePhoto()
+                        lastPhotoFile = photoFile
                         call.respondText("{\"url\": \"/${photoFile.name}\"}", ContentType.Application.Json)
-                    } catch (e: Exception) { call.respond(HttpStatusCode.InternalServerError, "{\"error\": \"${e.message}\"}") }
+                    } catch (e: Exception) {
+                        call.respond(HttpStatusCode.InternalServerError, "{\"error\": \"${e.message}\"}")
+                    }
+                }
+
+                post("/api/set-wallpaper-last") {
+                    try {
+                        val file = lastPhotoFile ?: throw Exception("No photo taken yet")
+                        val bitmap = BitmapFactory.decodeFile(file.absolutePath)
+                        WallpaperManager.getInstance(this@MainActivity).setBitmap(bitmap)
+                        call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
+                    } catch (e: Exception) {
+                        call.respond(HttpStatusCode.InternalServerError, "{\"error\": \"${e.message}\"}")
+                    }
+                }
+
+                post("/api/set-wallpaper-upload") {
+                    try {
+                        val multipart = call.receiveMultipart()
+                        var bitmap: android.graphics.Bitmap? = null
+                        multipart.forEachPart { part ->
+                            if (part is PartData.FileItem) {
+                                val bytes = part.streamProvider().readBytes()
+                                bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                            }
+                            part.dispose()
+                        }
+                        if (bitmap != null) {
+                            WallpaperManager.getInstance(this@MainActivity).setBitmap(bitmap)
+                            call.respondText("{\"status\": \"success\"}", ContentType.Application.Json)
+                        } else {
+                            call.respond(HttpStatusCode.BadRequest, "{\"error\": \"No image uploaded\"}")
+                        }
+                    } catch (e: Exception) {
+                        call.respond(HttpStatusCode.InternalServerError, "{\"error\": \"${e.message}\"}")
+                    }
                 }
 
                 get("/api/projection") {
@@ -438,14 +624,52 @@ class MainActivity : ComponentActivity() {
                                     writeStringUtf8("\r\n")
                                     flush()
                                 }
-                                delay(100)
+                                delay(60) // High FPS
                             }
                         } catch (e: Exception) { }
+                    }
+                }
+
+                post("/api/projection-res") {
+                    val w = call.request.queryParameters["w"]?.toIntOrNull() ?: 640
+                    val h = call.request.queryParameters["h"]?.toIntOrNull() ?: 360
+                    val intent = Intent(this@MainActivity, ProjectionService::class.java).apply {
+                        putExtra("width", w)
+                        putExtra("height", h)
+                    }
+                    startService(intent)
+                    call.respondText("{\"status\": \"updated\"}", ContentType.Application.Json)
+                }
+
+                get("/api/notifications") {
+                    val list = NotificationReceiverService.notifications
+                    val json = Gson().toJson(list)
+                    call.respondText(json, ContentType.Application.Json)
+                }
+
+                get("/") {
+                    when (currentServedPath) {
+                        SCREEN_MIRROR_TAG -> call.respondText(getProjectionHtml(), ContentType.Text.Html)
+                        NOTIFICATIONS_TAG -> call.respondText(getNotificationsHtml(), ContentType.Text.Html)
+                        else -> {
+                            val indexHtml = File(dir, "index.html")
+                            if (indexHtml.exists()) call.respondFile(indexHtml)
+                            else {
+                                val files = dir.listFiles()?.sortedWith(compareBy({ !it.isDirectory }, { it.name })) ?: emptyList()
+                                call.respondText(generateDirectoryListing("", files), ContentType.Text.Html)
+                            }
+                        }
                     }
                 }
                 
                 get("/{path...}") {
                     val relativePath = call.parameters.getAll("path")?.joinToString("/") ?: ""
+                    if (relativePath == "index.html" || relativePath == "index.htm") {
+                        when (currentServedPath) {
+                            SCREEN_MIRROR_TAG -> { call.respondText(getProjectionHtml(), ContentType.Text.Html); return@get }
+                            NOTIFICATIONS_TAG -> { call.respondText(getNotificationsHtml(), ContentType.Text.Html); return@get }
+                        }
+                    }
                     val requestedFile = File(dir, relativePath)
                     if (!requestedFile.exists()) { call.respond(HttpStatusCode.NotFound, "File not found"); return@get }
                     if (requestedFile.isDirectory) {
@@ -456,26 +680,29 @@ class MainActivity : ComponentActivity() {
                             indexHtm.exists() -> call.respondFile(indexHtm)
                             else -> {
                                 val files = requestedFile.listFiles()?.sortedWith(compareBy({ !it.isDirectory }, { it.name })) ?: emptyList()
-                                val htmlContent = buildString {
-                                    append("<html><head><title>Index of /$relativePath</title>")
-                                    append("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">")
-                                    append("<style>body{font-family:sans-serif;padding:20px;} li{margin:10px 0;} a{text-decoration:none;color:#007bff;} a:hover{text-decoration:underline;}</style>")
-                                    append("</head><body>")
-                                    append("<h1>Index of /$relativePath</h1><hr><ul>")
-                                    if (relativePath.isNotEmpty()) append("<li><a href=\"..\">.. (Parent Directory)</a></li>")
-                                    files.forEach { file ->
-                                        val name = file.name + (if (file.isDirectory) "/" else "")
-                                        append("<li><a href=\"$name\">$name</a></li>")
-                                    }
-                                    append("</ul><hr></body></html>")
-                                }
-                                call.respondText(htmlContent, ContentType.Text.Html)
+                                call.respondText(generateDirectoryListing(relativePath, files), ContentType.Text.Html)
                             }
                         }
                     } else { call.respondFile(requestedFile) }
                 }
             }
         }.start(wait = false)
+    }
+
+    private fun generateDirectoryListing(relativePath: String, files: List<File>): String {
+        return buildString {
+            append("<html><head><title>Index of /$relativePath</title>")
+            append("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">")
+            append("<style>body{font-family:sans-serif;padding:20px;} li{margin:10px 0;} a{text-decoration:none;color:#007bff;} a:hover{text-decoration:underline;}</style>")
+            append("</head><body>")
+            append("<h1>Index of /$relativePath</h1><hr><ul>")
+            if (relativePath.isNotEmpty()) append("<li><a href=\"..\">.. (Parent Directory)</a></li>")
+            files.forEach { file ->
+                val name = file.name + (if (file.isDirectory) "/" else "")
+                append("<li><a href=\"$name\">$name</a></li>")
+            }
+            append("</ul><hr></body></html>")
+        }
     }
 
     private fun restartServer(newPath: String) {
@@ -490,6 +717,7 @@ class MainActivity : ComponentActivity() {
         captureSession?.close()
         cameraDevice?.close()
         cameraImageReader?.close()
+        previewImageReader?.close()
         backgroundThread?.quitSafely()
     }
 
@@ -572,7 +800,11 @@ fun HomeScreen(serverUrl: String, currentServedPath: String, padding: androidx.c
         }
         Spacer(modifier = Modifier.height(16.dp))
         Text(
-            text = if (currentServedPath == "INTERNAL://ANDROID_AUTO") "Streaming Android Auto" else "Serving: $currentServedPath",
+            text = when(currentServedPath) {
+                SCREEN_MIRROR_TAG -> "Screen Mirroring Active"
+                NOTIFICATIONS_TAG -> "Notifications Display Active"
+                else -> "Serving: $currentServedPath"
+            },
             style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.padding(16.dp)
         )
@@ -596,14 +828,32 @@ fun FavoritesScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Icon(
-                        imageVector = if (path == "INTERNAL://ANDROID_AUTO") Icons.Default.Favorite else Icons.Default.Folder,
+                        imageVector = when(path) {
+                            SCREEN_MIRROR_TAG -> Icons.Default.Favorite
+                            NOTIFICATIONS_TAG -> Icons.Default.Notifications
+                            else -> Icons.Default.Folder
+                        },
                         contentDescription = null,
                         tint = if (path == currentServedPath) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
                     )
                     Spacer(modifier = Modifier.width(16.dp))
                     Column {
-                        Text(text = if (path == "INTERNAL://ANDROID_AUTO") "Android Auto" else File(path).name.ifEmpty { "Root" }, style = MaterialTheme.typography.bodyLarge)
-                        Text(text = if (path == "INTERNAL://ANDROID_AUTO") "System Head-Unit Projection" else path, style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            text = when(path) {
+                                SCREEN_MIRROR_TAG -> "Screen Mirror"
+                                NOTIFICATIONS_TAG -> "Notifications"
+                                else -> File(path).name.ifEmpty { "Root" }
+                            },
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                        Text(
+                            text = when(path) {
+                                SCREEN_MIRROR_TAG -> "Live Web Projection"
+                                NOTIFICATIONS_TAG -> "Last 10 Notifications"
+                                else -> path
+                            },
+                            style = MaterialTheme.typography.bodySmall
+                        )
                     }
                     if (path == currentServedPath) {
                         Spacer(modifier = Modifier.weight(1f))
