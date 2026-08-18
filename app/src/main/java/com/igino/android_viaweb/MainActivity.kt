@@ -14,6 +14,10 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.content.ComponentName
 import android.view.Surface
+import android.view.accessibility.AccessibilityManager
+import android.accessibilityservice.AccessibilityServiceInfo
+import androidx.compose.material.icons.filled.Apps
+import androidx.compose.material.icons.filled.List
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -56,6 +60,8 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.BatteryFull
+import androidx.compose.material.icons.filled.Apps
+import androidx.compose.material.icons.filled.List
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -109,6 +115,20 @@ private const val SCREEN_MIRROR_TAG = "INTERNAL://SCREEN_MIRROR"
 private const val NOTIFICATIONS_TAG = "INTERNAL://NOTIFICATIONS"
 private const val GPS_TAG = "INTERNAL://GPS"
 private const val BATTERY_TAG = "INTERNAL://BATTERY"
+private const val APPS_TAG = "INTERNAL://APPS"
+private const val LOGCAT_TAG = "INTERNAL://LOGCAT"
+
+private fun isAccessibilityServiceEnabled(context: Context): Boolean {
+    val am = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as AccessibilityManager
+    val enabledServices = am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_GENERIC)
+    for (service in enabledServices) {
+        if (service.resolveInfo.serviceInfo.packageName == context.packageName &&
+            service.resolveInfo.serviceInfo.name == RemoteControlService::class.java.name) {
+            return true
+        }
+    }
+    return false
+}
 
 class MainActivity : ComponentActivity() {
     private var server: EmbeddedServer<*, *>? = null
@@ -129,24 +149,36 @@ class MainActivity : ComponentActivity() {
     private var lastLocation: Location? = null
     private val favoritePaths = mutableStateListOf<String>()
     private lateinit var favoritesManager: FavoritesManager
+    
+    private var locationListener: LocationListener? = null
 
     private fun startLocationUpdates() {
+        if (locationListener != null) return
         val locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         try {
+            locationListener = object : LocationListener {
+                override fun onLocationChanged(location: Location) {
+                    lastLocation = location
+                }
+                override fun onProviderEnabled(provider: String) {}
+                override fun onProviderDisabled(provider: String) {}
+                override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+            }
             locationManager.requestLocationUpdates(
                 LocationManager.GPS_PROVIDER,
                 2000L,
                 1f,
-                object : LocationListener {
-                    override fun onLocationChanged(location: Location) {
-                        lastLocation = location
-                    }
-                    override fun onProviderEnabled(provider: String) {}
-                    override fun onProviderDisabled(provider: String) {}
-                    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-                }
+                locationListener!!
             )
         } catch (e: SecurityException) { e.printStackTrace() }
+    }
+
+    private fun stopLocationUpdates() {
+        locationListener?.let {
+            val locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            locationManager.removeUpdates(it)
+            locationListener = null
+        }
     }
 
     private fun isNotificationServiceEnabled(): Boolean {
@@ -259,7 +291,7 @@ class MainActivity : ComponentActivity() {
         if (permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
             permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
         ) {
-            startLocationUpdates()
+            startGpsServing()
         }
     }
 
@@ -283,12 +315,6 @@ class MainActivity : ComponentActivity() {
             requestPermissionLauncher.launch(Manifest.permission.CAMERA)
         } else {
             startCamera()
-        }
-
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            requestLocationPermissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
-        } else {
-            startLocationUpdates()
         }
 
         if (android.os.Build.VERSION.SDK_INT >= 33) {
@@ -323,10 +349,18 @@ class MainActivity : ComponentActivity() {
         if (!favoritePaths.contains(NOTIFICATIONS_TAG)) favoritePaths.add(NOTIFICATIONS_TAG)
         if (!favoritePaths.contains(GPS_TAG)) favoritePaths.add(GPS_TAG)
         if (!favoritePaths.contains(BATTERY_TAG)) favoritePaths.add(BATTERY_TAG)
+        if (!favoritePaths.contains(APPS_TAG)) favoritePaths.add(APPS_TAG)
+        if (!favoritePaths.contains(LOGCAT_TAG)) favoritePaths.add(LOGCAT_TAG)
 
         if (!isNotificationServiceEnabled()) {
             try {
                 startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
+            } catch (e: Exception) { e.printStackTrace() }
+        }
+
+        if (!isAccessibilityServiceEnabled(this)) {
+            try {
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             } catch (e: Exception) { e.printStackTrace() }
         }
 
@@ -343,19 +377,31 @@ class MainActivity : ComponentActivity() {
                         if (newPath != SCREEN_MIRROR_TAG && currentServedPath == SCREEN_MIRROR_TAG) {
                             stopService(Intent(this, ProjectionService::class.java))
                         }
+                        if (newPath != GPS_TAG && currentServedPath == GPS_TAG) {
+                            stopLocationUpdates()
+                        }
                         
                         when (newPath) {
-                            SCREEN_MIRROR_TAG -> startScreenProjection()
+                            SCREEN_MIRROR_TAG -> {
+                                if (!isAccessibilityServiceEnabled(this)) {
+                                    try {
+                                        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                                    } catch (e: Exception) { e.printStackTrace() }
+                                }
+                                startScreenProjection()
+                            }
                             NOTIFICATIONS_TAG -> startNotificationsServing()
                             GPS_TAG -> startGpsServing()
                             BATTERY_TAG -> startBatteryServing()
+                            APPS_TAG -> startAppsServing()
+                            LOGCAT_TAG -> startLogcatServing()
                             else -> {
                                 currentServedPath = newPath
                             }
                         }
                     },
                     onToggleFavorite = { path ->
-                        if (path == SCREEN_MIRROR_TAG || path == NOTIFICATIONS_TAG || path == GPS_TAG || path == BATTERY_TAG) return@Android_viawebApp
+                        if (path == SCREEN_MIRROR_TAG || path == NOTIFICATIONS_TAG || path == GPS_TAG || path == BATTERY_TAG || path == APPS_TAG || path == LOGCAT_TAG) return@Android_viawebApp
                         if (favoritePaths.contains(path)) {
                             if (path != defaultDir.absolutePath) {
                                 favoritePaths.remove(path)
@@ -383,11 +429,162 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startGpsServing() {
-        currentServedPath = GPS_TAG
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            requestLocationPermissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+        } else {
+            startLocationUpdates()
+            currentServedPath = GPS_TAG
+        }
     }
 
     private fun startBatteryServing() {
         currentServedPath = BATTERY_TAG
+    }
+
+    private fun startAppsServing() {
+        currentServedPath = APPS_TAG
+    }
+
+    private fun startLogcatServing() {
+        currentServedPath = LOGCAT_TAG
+    }
+
+    private fun getLogcatHtml(): String {
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>System Logcat</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <style>
+                    body { font-family: 'Courier New', monospace; padding: 20px; background-color: #1e1e1e; color: #d4d4d4; }
+                    #log-container { white-space: pre-wrap; word-wrap: break-word; font-size: 0.85rem; line-height: 1.4; max-width: 100%; }
+                    .log-entry { margin-bottom: 2px; border-bottom: 1px solid #333; padding: 2px 0; }
+                    .level-E { color: #f44336; font-weight: bold; }
+                    .level-W { color: #ffeb3b; }
+                    .level-I { color: #4caf50; }
+                    .level-D { color: #2196f3; }
+                    .level-V { color: #9e9e9e; }
+                    h1 { font-family: sans-serif; color: #fff; text-align: center; }
+                    .controls { position: sticky; top: 0; background: #1e1e1e; padding: 10px; border-bottom: 1px solid #444; display: flex; gap: 10px; justify-content: center; z-index: 100; }
+                    button { padding: 8px 15px; cursor: pointer; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; }
+                    button:hover { background: #444; }
+                </style>
+            </head>
+            <body>
+                ${getSidebarHtml()}
+                <div class="controls">
+                    <button onclick="clearLogs()">Clear Screen</button>
+                    <button onclick="scrollToBottom()">Scroll to Bottom</button>
+                </div>
+                <h1>Live System Logcat</h1>
+                <div id="log-container">Loading logs...</div>
+                <script>
+                    let lastTimestamp = 0;
+                    function clearLogs() { document.getElementById('log-container').innerHTML = ''; }
+                    function scrollToBottom() { window.scrollTo(0, document.body.scrollHeight); }
+                    
+                    async function fetchLogs() {
+                        try {
+                            const response = await fetch('/api/logcat');
+                            const logs = await response.json();
+                            const container = document.getElementById('log-container');
+                            if (container.innerText === 'Loading logs...') container.innerText = '';
+                            
+                            logs.forEach(line => {
+                                const div = document.createElement('div');
+                                div.className = 'log-entry';
+                                if (line.includes(' E ')) div.classList.add('level-E');
+                                else if (line.includes(' W ')) div.classList.add('level-W');
+                                else if (line.includes(' I ')) div.classList.add('level-I');
+                                else if (line.includes(' D ')) div.classList.add('level-D');
+                                div.textContent = line;
+                                container.appendChild(div);
+                            });
+                            
+                            if (logs.length > 0) {
+                                // Limit to last 500 lines to prevent browser lag
+                                while (container.children.length > 500) {
+                                    container.removeChild(container.firstChild);
+                                }
+                            }
+                        } catch (e) { console.error(e); }
+                    }
+                    setInterval(fetchLogs, 2000);
+                    fetchLogs();
+                </script>
+                ${getWatchdogScript(LOGCAT_TAG)}
+            </body>
+            </html>
+        """.trimIndent()
+    }
+
+    private fun getInstalledApps(): List<Map<String, String>> {
+        val pm = packageManager
+        val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+        return apps.filter { app ->
+            pm.getLaunchIntentForPackage(app.packageName) != null
+        }.map { app ->
+            mapOf(
+                "name" to app.loadLabel(pm).toString(),
+                "packageName" to app.packageName
+            )
+        }.sortedBy { it["name"] }
+    }
+
+    private fun getAppsHtml(): String {
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>App Launcher</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <style>
+                    body { font-family: sans-serif; padding: 20px; background-color: #f0f2f5; color: #1c1e21; }
+                    .container { max-width: 800px; margin: 0 auto; }
+                    h1 { text-align: center; color: #1877f2; }
+                    .app-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 20px; margin-top: 30px; }
+                    .app-card { background: white; padding: 15px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); text-align: center; cursor: pointer; transition: transform 0.2s, box-shadow 0.2s; }
+                    .app-card:hover { transform: translateY(-5px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+                    .app-icon { font-size: 2.5rem; margin-bottom: 10px; }
+                    .app-name { font-weight: bold; font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+                    .app-package { font-size: 0.7rem; color: #65676b; overflow: hidden; text-overflow: ellipsis; }
+                </style>
+            </head>
+            <body>
+                ${getSidebarHtml()}
+                <div class="container">
+                    <h1>Installed Apps</h1>
+                    <div id="app-grid" class="app-grid">Loading apps...</div>
+                </div>
+                <script>
+                    async function fetchApps() {
+                        try {
+                            const response = await fetch('/api/apps');
+                            const apps = await response.json();
+                            const grid = document.getElementById('app-grid');
+                            grid.innerHTML = apps.map(app => `
+                                <div class="app-card" onclick="launchApp('${"$"}{app.packageName}')">
+                                    <div class="app-icon">📱</div>
+                                    <div class="app-name" title="${"$"}{app.name}">${"$"}{app.name}</div>
+                                    <div class="app-package" title="${"$"}{app.packageName}">${"$"}{app.packageName}</div>
+                                </div>
+                            `).join('');
+                        } catch (e) {
+                            document.getElementById('app-grid').innerText = 'Error loading apps';
+                        }
+                    }
+                    async function launchApp(pkg) {
+                        try {
+                            await fetch('/api/launch-app?package=' + pkg, { method: 'POST' });
+                        } catch (e) { alert('Failed to launch app'); }
+                    }
+                    fetchApps();
+                </script>
+                ${getWatchdogScript(APPS_TAG)}
+            </body>
+            </html>
+        """.trimIndent()
     }
 
     private fun getSidebarHtml(): String {
@@ -397,6 +594,8 @@ class MainActivity : ComponentActivity() {
                 NOTIFICATIONS_TAG -> "Notifications"
                 GPS_TAG -> "GPS Tracker"
                 BATTERY_TAG -> "Battery Status"
+                APPS_TAG -> "Apps"
+                LOGCAT_TAG -> "Logcat"
                 else -> File(path).name.ifEmpty { "Root" }
             }
             val activeClass = if (path == currentServedPath) "active" else ""
@@ -618,7 +817,7 @@ class MainActivity : ComponentActivity() {
             </head>
             <body>
                 ${getSidebarHtml()}
-                <img id="stream" src="/api/projection" alt="Screen Mirror">
+                <img id="stream" src="/api/projection" alt="Screen Mirror" onmousedown="handleStart(event)" onmouseup="handleEnd(event)" ontouchstart="handleStart(event)" ontouchend="handleEnd(event)" style="cursor: crosshair;">
                 <div class="res-controls">
                     <button class="res-btn" onclick="setRes(426, 240, this)">240p</button>
                     <button class="res-btn active" onclick="setRes(640, 360, this)">360p</button>
@@ -628,6 +827,32 @@ class MainActivity : ComponentActivity() {
                 </div>
                 <div class="overlay">Screen Mirror Mode</div>
                 <script>
+                    let startX, startY, startTime;
+                    function handleStart(e) {
+                        e.preventDefault();
+                        const rect = e.target.getBoundingClientRect();
+                        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+                        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+                        startX = (clientX - rect.left) / rect.width;
+                        startY = (clientY - rect.top) / rect.height;
+                        startTime = new Date().getTime();
+                    }
+                    async function handleEnd(e) {
+                        e.preventDefault();
+                        const rect = e.target.getBoundingClientRect();
+                        const clientX = (e.changedTouches ? e.changedTouches[0].clientX : e.clientX);
+                        const clientY = (e.changedTouches ? e.changedTouches[0].clientY : e.clientY);
+                        const endX = (clientX - rect.left) / rect.width;
+                        const endY = (clientY - rect.top) / rect.height;
+                        const duration = new Date().getTime() - startTime;
+
+                        if (Math.abs(endX - startX) < 0.02 && Math.abs(endY - startY) < 0.02) {
+                            fetch(`/api/touch?x=${"$"}{startX}&y=${"$"}{startY}`, { method: 'POST' });
+                        } else {
+                            fetch(`/api/swipe?x1=${"$"}{startX}&y1=${"$"}{startY}&x2=${"$"}{endX}&y2=${"$"}{endY}&duration=${"$"}{duration}`, { method: 'POST' });
+                        }
+                    }
+
                     async function rotateScreen() {
                         try {
                             const response = await fetch('/api/rotate-screen', { method: 'POST' });
@@ -709,6 +934,7 @@ class MainActivity : ComponentActivity() {
 
     private fun exitApp() {
         stopService(Intent(this, ProjectionService::class.java))
+        stopLocationUpdates()
         server?.stop(500, 1000)
         captureSession?.close()
         cameraDevice?.close()
@@ -998,6 +1224,35 @@ class MainActivity : ComponentActivity() {
                     call.respondText("{\"status\": \"updated\"}", ContentType.Application.Json)
                 }
 
+                post("/api/touch") {
+                    val x = call.request.queryParameters["x"]?.toFloatOrNull() ?: 0f
+                    val y = call.request.queryParameters["y"]?.toFloatOrNull() ?: 0f
+                    
+                    val metrics = resources.displayMetrics
+                    val screenX = x * metrics.widthPixels
+                    val screenY = y * metrics.heightPixels
+                    
+                    RemoteControlService.instance?.dispatchClick(screenX, screenY)
+                    call.respondText("{\"status\": \"touched\"}", ContentType.Application.Json)
+                }
+
+                post("/api/swipe") {
+                    val x1 = call.request.queryParameters["x1"]?.toFloatOrNull() ?: 0f
+                    val y1 = call.request.queryParameters["y1"]?.toFloatOrNull() ?: 0f
+                    val x2 = call.request.queryParameters["x2"]?.toFloatOrNull() ?: 0f
+                    val y2 = call.request.queryParameters["y2"]?.toFloatOrNull() ?: 0f
+                    val duration = call.request.queryParameters["duration"]?.toLongOrNull() ?: 300L
+
+                    val metrics = resources.displayMetrics
+                    val screenX1 = x1 * metrics.widthPixels
+                    val screenY1 = y1 * metrics.heightPixels
+                    val screenX2 = x2 * metrics.widthPixels
+                    val screenY2 = y2 * metrics.heightPixels
+
+                    RemoteControlService.instance?.dispatchSwipe(screenX1, screenY1, screenX2, screenY2, duration)
+                    call.respondText("{\"status\": \"swiped\"}", ContentType.Application.Json)
+                }
+
                 post("/api/rotate-screen") {
                     if (Settings.System.canWrite(this@MainActivity)) {
                         try {
@@ -1065,6 +1320,33 @@ class MainActivity : ComponentActivity() {
                     call.respondText(Gson().toJson(info), ContentType.Application.Json)
                 }
 
+                get("/api/apps") {
+                    val apps = getInstalledApps()
+                    call.respondText(Gson().toJson(apps), ContentType.Application.Json)
+                }
+
+                post("/api/launch-app") {
+                    val pkg = call.request.queryParameters["package"] ?: return@post call.respond(HttpStatusCode.BadRequest)
+                    val intent = packageManager.getLaunchIntentForPackage(pkg)
+                    if (intent != null) {
+                        startActivity(intent)
+                        call.respondText("Launched")
+                    } else {
+                        call.respond(HttpStatusCode.NotFound, "App not found")
+                    }
+                }
+
+                get("/api/logcat") {
+                    try {
+                        val process = Runtime.getRuntime().exec("logcat -d -t 100")
+                        val reader = process.inputStream.bufferedReader()
+                        val logs = reader.readLines()
+                        call.respondText(Gson().toJson(logs), ContentType.Application.Json)
+                    } catch (e: Exception) {
+                        call.respond(HttpStatusCode.InternalServerError, "Error reading logs")
+                    }
+                }
+
                 get("/") {
                     val currentPath = currentServedPath
                     when (currentPath) {
@@ -1072,6 +1354,8 @@ class MainActivity : ComponentActivity() {
                         NOTIFICATIONS_TAG -> call.respondText(getNotificationsHtml(), ContentType.Text.Html)
                         GPS_TAG -> call.respondText(getGpsHtml(), ContentType.Text.Html)
                         BATTERY_TAG -> call.respondText(getBatteryHtml(), ContentType.Text.Html)
+                        APPS_TAG -> call.respondText(getAppsHtml(), ContentType.Text.Html)
+                        LOGCAT_TAG -> call.respondText(getLogcatHtml(), ContentType.Text.Html)
                         else -> {
                             val dir = File(currentPath)
                             val indexHtml = File(dir, "index.html")
@@ -1093,6 +1377,8 @@ class MainActivity : ComponentActivity() {
                             NOTIFICATIONS_TAG -> { call.respondText(getNotificationsHtml(), ContentType.Text.Html); return@get }
                             GPS_TAG -> { call.respondText(getGpsHtml(), ContentType.Text.Html); return@get }
                             BATTERY_TAG -> { call.respondText(getBatteryHtml(), ContentType.Text.Html); return@get }
+                            APPS_TAG -> { call.respondText(getAppsHtml(), ContentType.Text.Html); return@get }
+                            LOGCAT_TAG -> { call.respondText(getLogcatHtml(), ContentType.Text.Html); return@get }
                         }
                     }
                     val requestedFile = File(File(currentPath), relativePath)
@@ -1136,6 +1422,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         stopService(Intent(this, ProjectionService::class.java))
+        stopLocationUpdates()
         server?.stop(1000, 5000)
         captureSession?.close()
         cameraDevice?.close()
@@ -1228,6 +1515,8 @@ fun HomeScreen(serverUrl: String, currentServedPath: String, padding: androidx.c
                 NOTIFICATIONS_TAG -> "Notifications Display Active"
                 GPS_TAG -> "GPS Tracking Active"
                 BATTERY_TAG -> "Battery Monitor Active"
+                APPS_TAG -> "App Launcher Active"
+                LOGCAT_TAG -> "System Logcat Active"
                 else -> "Serving: $currentServedPath"
             },
             style = MaterialTheme.typography.bodyMedium,
@@ -1258,6 +1547,8 @@ fun FavoritesScreen(
                             NOTIFICATIONS_TAG -> Icons.Default.Notifications
                             GPS_TAG -> Icons.Default.LocationOn
                             BATTERY_TAG -> Icons.Default.BatteryFull
+                            APPS_TAG -> Icons.Default.Apps
+                            LOGCAT_TAG -> Icons.Default.List
                             else -> Icons.Default.Folder
                         },
                         contentDescription = null,
@@ -1271,6 +1562,8 @@ fun FavoritesScreen(
                                 NOTIFICATIONS_TAG -> "Notifications"
                                 GPS_TAG -> "GPS Tracker"
                                 BATTERY_TAG -> "Battery Status"
+                                APPS_TAG -> "App Launcher"
+                                LOGCAT_TAG -> "System Logcat"
                                 else -> File(path).name.ifEmpty { "Root" }
                             },
                             style = MaterialTheme.typography.bodyLarge
@@ -1281,6 +1574,8 @@ fun FavoritesScreen(
                                 NOTIFICATIONS_TAG -> "Last 10 Notifications"
                                 GPS_TAG -> "Live Position Data"
                                 BATTERY_TAG -> "Level and Health Info"
+                                APPS_TAG -> "Launch Installed Apps"
+                                LOGCAT_TAG -> "Live Android Logs"
                                 else -> path
                             },
                             style = MaterialTheme.typography.bodySmall

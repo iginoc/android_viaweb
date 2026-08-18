@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">android_viaweb</string>
+    <string name="accessibility_service_description">Permette di controllare il touchscreen dello smartphone via web.</string>
 </resources>
